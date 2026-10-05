@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Simple Mobile AR Lab - Hiro GIF</title>
+
+  <!-- ใช้ไลบรารีและเวอร์ชันเดียวกับชุดตัวอย่าง -->
+  <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+  <script src="https://raw.githack.com/AR-js-org/AR.js/3.4.7/aframe/build/aframe-ar.js"></script>
+  <!-- อ่าน GIF เป็นเฟรม เพื่อปรับความเร็วได้
+       gifuct-js 2.1.2 ไม่มี browser bundle ที่ /dist/ จึงโหลดผ่าน ESM CDN -->
+  <script type="module">
+    window.gifuctReady = (async () => {
+      try {
+        const mod = await import("https://esm.sh/gifuct-js@2.1.2");
+        window.gifuct = {
+          parseGIF: mod.parseGIF,
+          decompressFrames: mod.decompressFrames
+        };
+        window.dispatchEvent(new Event("gifuct-ready"));
+      } catch (error) {
+        console.error("ไม่สามารถโหลด gifuct-js:", error);
+        window.dispatchEvent(new CustomEvent("gifuct-error", { detail: error }));
+        throw error;
+      }
+    })();
+  </script>
+
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #111;
+    }
+
+    #top-panel {
+      position: fixed;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 20;
+      width: min(92vw, 560px);
+      padding: 10px 14px;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.68);
+      color: white;
+      text-align: center;
+      font-size: 15px;
+      line-height: 1.4;
+      backdrop-filter: blur(4px);
+    }
+
+    #controls {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 18px;
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 9px;
+      padding: 0 12px;
+    }
+
+    #speed-row {
+      display: flex;
+      gap: 6px;
+      width: min(96vw, 620px);
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    button {
+      min-height: 46px;
+      border: 0;
+      border-radius: 12px;
+      padding: 9px 13px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    .speed {
+      background: #374151;
+      color: white;
+      min-width: 62px;
+    }
+
+    .speed.active {
+      outline: 2px solid #5eead4;
+      background: #111827;
+    }
+
+    .main-button {
+      min-width: 145px;
+      background: white;
+      color: #111;
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .hint {
+      display: block;
+      margin-top: 4px;
+      font-size: 12px;
+      opacity: 0.8;
+    }
+  </style>
+
+  <script>
+    /*
+     * Animated GIF -> Canvas texture
+     * ใช้ GIF เดิมของผู้ใช้ และควบคุมความเร็วด้วย playbackRate
+     */
+    AFRAME.registerComponent('animated-gif', {
+      schema: {
+        src: { type: 'string' },
+        speed: { type: 'number', default: 1 }
+      },
+
+      init: function () {
+        this.frames = [];
+        this.canvas = document.createElement('canvas');
+        this.ctx = this.canvas.getContext('2d', { willReadFrequently: false });
+        this.texture = null;
+        this.currentFrame = 0;
+        this.lastTime = 0;
+        this.speed = this.data.speed;
+        this.loading = true;
+        this.baseImage = null;
+        this.composited = null;
+
+        this.load();
+      },
+
+      update: function (oldData) {
+        if (oldData && oldData.speed !== this.data.speed) {
+          this.speed = this.data.speed;
+        }
+      },
+
+      load: async function () {
+        try {
+          // รอ gifuct-js ให้พร้อมก่อนถอด GIF
+          if (window.gifuctReady) {
+            await window.gifuctReady;
+          }
+
+          if (!window.gifuct ||
+              typeof window.gifuct.parseGIF !== 'function' ||
+              typeof window.gifuct.decompressFrames !== 'function') {
+            throw new Error('gifuct-js ไม่พร้อมใช้งาน');
+          }
+
+          // โหลด GIF จากโฟลเดอร์เดียวกับ index.html
+          const gifURL = new URL(this.data.src, document.baseURI).href;
+          const response = await fetch(gifURL, {
+            cache: 'no-store',
+            credentials: 'same-origin'
+          });
+
+          if (!response.ok) {
+            throw new Error('ไม่พบ GIF: HTTP ' + response.status);
+          }
+
+          const buffer = await response.arrayBuffer();
+          if (!buffer.byteLength) throw new Error('ไฟล์ GIF ว่างเปล่า');
+
+          const gif = window.gifuct.parseGIF(buffer);
+          this.frames = window.gifuct.decompressFrames(gif, true);
+
+          if (!this.frames.length) throw new Error('GIF ไม่มีเฟรม');
+
+          const width = gif.lsd.width;
+          const height = gif.lsd.height;
+
+          this.canvas.width = width;
+          this.canvas.height = height;
+
+          this.texture = new THREE.CanvasTexture(this.canvas);
+          this.texture.colorSpace = THREE.SRGBColorSpace;
+          this.texture.minFilter = THREE.LinearFilter;
+          this.texture.magFilter = THREE.LinearFilter;
+
+          const mesh = this.el.getObject3D('mesh');
+          if (mesh) {
+            mesh.material.map = this.texture;
+            mesh.material.transparent = true;
+            mesh.material.needsUpdate = true;
+          } else {
+            this.el.addEventListener('object3dset', (e) => {
+              if (e.detail.type !== 'mesh') return;
+              const m = this.el.getObject3D('mesh');
+              if (m) {
+                m.material.map = this.texture;
+                m.material.transparent = true;
+                m.material.needsUpdate = true;
+              }
+            });
+          }
+
+          /*
+           * composited = ภาพสะสมของ GIF
+           * รองรับ GIF ที่มีเฟรมเป็น patch ไม่ใช่ภาพเต็มทุกเฟรม
+           */
+          this.composited = document.createElement('canvas');
+          this.composited.width = width;
+          this.composited.height = height;
+
+          this.drawFrame(0, true);
+          this.loading = false;
+
+          const topPanel = document.querySelector('#top-panel');
+          if (topPanel.dataset.markerFound === 'true') {
+            topPanel.innerHTML =
+              'พบ Hiro Marker แล้ว — GIF พร้อมใช้งาน' +
+              '<span class="hint">เลือกความเร็วด้านล่างได้เลย</span>';
+          }
+
+          requestAnimationFrame(this.animate.bind(this));
+        } catch (err) {
+          console.error('GIF load error:', err);
+          const topPanel = document.querySelector('#top-panel');
+          const message = err && err.message ? err.message : String(err);
+          topPanel.innerHTML =
+            'โหลด GIF ไม่สำเร็จ' +
+            '<span class="hint">' + message.replace(/[<>&"]/g, '') + '</span>';
+        }
+      },
+
+      clearCanvas: function () {
+        const cctx = this.composited.getContext('2d');
+        cctx.clearRect(0, 0, this.composited.width, this.composited.height);
+      },
+
+      drawFrame: function (index, reset) {
+        if (!this.frames.length) return;
+
+        const frame = this.frames[index];
+        const cctx = this.composited.getContext('2d');
+
+        if (reset) this.clearCanvas();
+
+        const imageData = new ImageData(
+          new Uint8ClampedArray(frame.patch),
+          frame.dims.width,
+          frame.dims.height
+        );
+
+        cctx.putImageData(imageData, frame.dims.left, frame.dims.top);
+
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        this.ctx.drawImage(this.composited, 0, 0);
+
+        if (this.texture) this.texture.needsUpdate = true;
+      },
+
+      animate: function (time) {
+        requestAnimationFrame(this.animate.bind(this));
+
+        if (this.loading || !this.frames.length || this.speed <= 0) return;
+
+        const frame = this.frames[this.currentFrame];
+        // gifuct-js คืนค่า delay เป็น milliseconds อยู่แล้ว
+        const originalDelay = Math.max(20, frame.delay || 100);
+        const delay = originalDelay / this.speed;
+
+        if (!this.lastTime) this.lastTime = time;
+
+        if (time - this.lastTime >= delay) {
+          /*
+           * ข้ามได้หลายเฟรมเมื่อความเร็วสูง เพื่อให้ 3x/4x ไม่ค้าง
+           */
+          const elapsed = time - this.lastTime;
+          const steps = Math.max(1, Math.floor(elapsed / delay));
+
+          for (let i = 0; i < steps; i++) {
+            this.currentFrame++;
+
+            if (this.currentFrame >= this.frames.length) {
+              this.currentFrame = 0;
+              this.clearCanvas();
+            }
+
+            this.drawFrame(this.currentFrame, false);
+          }
+
+          this.lastTime = time;
+        }
+      }
+    });
+
+    window.addEventListener('DOMContentLoaded', () => {
+      const marker = document.querySelector('#hiro-marker');
+      const gifPlane = document.querySelector('#gif-plane');
+      const topPanel = document.querySelector('#top-panel');
+      const speedButtons = [...document.querySelectorAll('.speed')];
+      const pauseButton = document.querySelector('#pause-button');
+
+      let markerFound = false;
+      let currentSpeed = 1;
+      let paused = false;
+
+      marker.addEventListener('markerFound', () => {
+        markerFound = true;
+        topPanel.dataset.markerFound = 'true';
+        topPanel.innerHTML =
+          'พบ Hiro Marker แล้ว — GIF พร้อมใช้งาน' +
+          '<span class="hint">เลือกความเร็วด้านล่างได้เลย</span>';
+      });
+
+      marker.addEventListener('markerLost', () => {
+        markerFound = false;
+        topPanel.dataset.markerFound = 'false';
+        topPanel.innerHTML =
+          'เล็งกล้องไปที่ Hiro Marker' +
+          '<span class="hint">อนุญาตให้เว็บไซต์ใช้กล้อง และให้เห็นกรอบ Hiro ครบทั้งสี่ด้าน</span>';
+      });
+
+      function setSpeed(value) {
+        currentSpeed = value;
+        paused = value === 0;
+
+        gifPlane.setAttribute('animated-gif', 'speed', value);
+
+        speedButtons.forEach(btn => {
+          btn.classList.toggle('active', Number(btn.dataset.speed) === value);
+        });
+
+        pauseButton.textContent = paused ? 'เล่น GIF' : 'หยุด GIF';
+      }
+
+      speedButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (!markerFound) return;
+          setSpeed(Number(btn.dataset.speed));
+        });
+      });
+
+      pauseButton.addEventListener('click', () => {
+        if (!markerFound) return;
+        paused = !paused;
+        const speed = paused ? 0 : currentSpeed || 1;
+        gifPlane.setAttribute('animated-gif', 'speed', speed);
+        pauseButton.textContent = paused ? 'เล่น GIF' : 'หยุด GIF';
+      });
+
+      /*
+       * ค่าเริ่มต้น
+       */
+      setSpeed(1);
+    });
+  </script>
+</head>
+
+<body>
+  <div id="top-panel">
+    เล็งกล้องไปที่ Hiro Marker
+    <span class="hint">อนุญาตให้เว็บไซต์ใช้กล้องเมื่อเบราว์เซอร์ถาม</span>
+  </div>
+
+  <div id="controls">
+    <div id="speed-row">
+      <button class="speed" data-speed="0.25" type="button">0.25×</button>
+      <button class="speed" data-speed="0.5" type="button">0.5×</button>
+      <button class="speed active" data-speed="1" type="button">1×</button>
+      <button class="speed" data-speed="1.5" type="button">1.5×</button>
+      <button class="speed" data-speed="2" type="button">2×</button>
+      <button class="speed" data-speed="3" type="button">3×</button>
+      <button class="speed" data-speed="4" type="button">4×</button>
+    </div>
+
+    <button id="pause-button" class="main-button" type="button">
+      หยุด GIF
+    </button>
+  </div>
+
+  <a-scene
+    embedded
+    vr-mode-ui="enabled: false"
+    renderer="logarithmicDepthBuffer: true; antialias: true; colorManagement: true"
+    arjs="sourceType: webcam; trackingMethod: best; debugUIEnabled: false"
+  >
+    <a-marker
+      id="hiro-marker"
+      preset="hiro"
+      emitevents="true"
+      smooth="true"
+      smooth-count="8"
+      smooth-tolerance="0.01"
+      smooth-threshold="3"
+    >
+      <!-- GIF แสดงบนระนาบ AR เหนือ Hiro -->
+      <a-plane
+        id="gif-plane"
+        position="0 0.9 0"
+        rotation="-90 0 0"
+        width="1.6"
+        height="1.6"
+        material="shader: flat; transparent: true; side: double"
+        animated-gif="src: ./limbus-company-limbus.gif; speed: 1"
+      ></a-plane>
+    </a-marker>
+
+    <a-entity camera></a-entity>
+  </a-scene>
+</body>
+</html>
